@@ -1,0 +1,18 @@
+# {{ ansible_managed }}
+# Percona mongodb_exporter: https://github.com/percona/mongodb_exporter
+[Unit]
+Description=Percona MongoDB exporter
+After=network.target mongod.service
+
+[Service]
+User=mongodb_exporter
+EnvironmentFile=/etc/mongodb_exporter.env
+# --collect-all        все коллекторы: diagnosticdata, dbstats, collstats, indexstats, top, currentop
+# --compatible-mode    плюс метрики со старыми именами (их ждут готовые дашборды)
+# --discovering-mode   collstats/indexstats сами находят коллекции
+ExecStart=/usr/local/bin/mongodb_exporter --collect-all --compatible-mode --discovering-mode \
+  --web.listen-address=:9216
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

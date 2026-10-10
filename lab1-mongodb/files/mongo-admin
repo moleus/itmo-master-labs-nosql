@@ -1,0 +1,8 @@
+#!/bin/sh
+# mongo-admin DB 'JS' — выполнить JS в mongosh под администратором.
+# Логин и пароль лежат в /etc/mongo-admin.env (читает только root).
+# shellcheck source=/dev/null  # файл создаёт Ansible на ВМ
+. /etc/mongo-admin.env
+exec mongosh --quiet "mongodb://127.0.0.1:27017/$1" \
+  -u "$MONGO_ADMIN_USER" -p "$MONGO_ADMIN_PASSWORD" --authenticationDatabase admin \
+  --eval "$2"

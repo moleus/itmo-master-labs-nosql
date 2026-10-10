@@ -1,0 +1,41 @@
+# Общие переменные для всех частей лабы.
+# Пароли открытым текстом: это учебный стенд, ВМ доступна только с хоста.
+
+mongo_series: "9.0"
+# С 9.0 ключ называется по мажорной версии (server-9.asc), а не server-9.0.asc.
+# Отпечаток B3B42B6C39E5CDDEC0A27E3CF366D55B602E502D, им подписан Release репозитория 9.0.
+mongo_repo_key: https://pgp.mongodb.com/server-9.asc
+mongo_port: 27017
+mongo_cache_gb: 0.5          # кэш WiredTiger. Маленький, чтобы под нагрузкой было видно вытеснение
+mongo_bind_ip: "{{ ansible_host }}"   # адрес ВМ в приватной сети, по нему же ходит Ansible
+
+mongo_admin_user: admin
+mongo_admin_password: admin-pass
+
+# Учебные базы и коллекции, которые создаёт шаг seed.
+lab_dbs: [shop, school]
+
+# Пользователи части 2. Все живут в базе shop.
+lab_users:
+  alice: { password: alice-pass }   # аналитик: читает shop
+  bob: { password: bob-pass }       # приложение: пишет заказы
+  carol: { password: carol-pass }   # поддержка: видит только клиентов
+
+backup_user: backup
+backup_password: backup-pass
+backup_dir: /var/backups/mongodb
+backup_db: shop              # база для шагов backup-one, backup-history, restore-date
+# Шаг schedule: cron делает копию всех учебных баз каждый день в 03:00 (время ВМ)
+# и удаляет копии старше backup_keep_days дней.
+backup_cron: { minute: "0", hour: "3" }
+backup_keep_days: 7
+
+exporter_version: "0.53.0"
+exporter_user: exporter
+exporter_password: exporter-pass
+vm_version: "1.153.0"
+grafana_version: "13.2.3"
+grafana_admin_password: admin-pass
+
+# Сопоставление ansible_architecture -> имя архитектуры в релизах на GitHub.
+release_arch: "{{ {'aarch64': 'arm64', 'x86_64': 'amd64'}[ansible_architecture] }}"

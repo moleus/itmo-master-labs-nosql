@@ -1,0 +1,31 @@
+TASK [load: result] ************************************************************
+ok: [soloviev-mongo] => 
+    msg:
+    - 'worker 8438: 1677800 events inserted'
+    - 'worker 8437: 1665600 events inserted'
+    - 'worker 8436: 1635000 events inserted'
+    - 'worker 8439: 1656000 events inserted'
+    - metric                        | before | during
+    - mongod up (1 = ok)            | 1 | 1
+    - uptime, s                     | 1177 | 1397
+    - connections current, max      | 5 | 23
+    - operations/s                  | 6.71 | 34842.18
+    - documents inserted/s          | 0 | 25652.92
+    - documents returned/s          | 1.1 | 5213.94
+    - collection scans/s            | 0 | 25.64
+    - scanned docs per returned doc | 0 | 99.39
+    - read latency avg, ms          | 0.59 | 1.59
+    - write latency avg, ms         | 0 | 2.89
+    - WT cache used max, %          | 1.61 | 81.16
+    - WT cache dirty max, %         | 0 | 6.2
+    - WT pages read into cache/s    | 0 | 31.51
+    - WT pages evicted/s            | 0 | 124.74
+    - write tickets in use, max     | 0 | 4
+    - journal MB/s                  | 0 | 6.26
+    - resident memory max, MB       | 241 | 689
+    - db shop data size, MB         | 3.06 | 1027.06
+    - host CPU busy, %              | 19.45 | 87.83
+    - 'grafana: http://127.0.0.1:3000/d/mongodb-lab?from=1793725570000&to=1793726231000'
+
+PLAY RECAP *********************************************************************
+soloviev-mongo             : ok=8    changed=4    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0   

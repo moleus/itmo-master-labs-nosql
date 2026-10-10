@@ -1,0 +1,7 @@
+# grafana/dashboard-linter. Исключения с причиной.
+exclusions:
+  # Панели хоста берут метрики node_exporter: у них job="node", а не $job.
+  target-job-rule:
+    entries:
+      - panel: CPU
+      - panel: Диск, байт/с

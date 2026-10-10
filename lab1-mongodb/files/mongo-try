@@ -1,0 +1,15 @@
+#!/bin/sh
+# mongo-try USER PASSWORD DB 'JS' — выполнить одну операцию под пользователем
+# и напечатать одну строку:
+#   USER | JS | ALLOWED <результат>     операция прошла
+#   USER | JS | DENIED <код ошибки>     сервер отказал (например Unauthorized)
+#   USER | JS | AUTH_FAILED             логин не прошёл (нет такого пользователя)
+user=$1 pass=$2 db=$3 js=$4
+out=$(mongosh --quiet "mongodb://127.0.0.1:27017/$db" -u "$user" -p "$pass" \
+  --authenticationDatabase "$db" --eval "
+try { const r = ($js); print('ALLOWED ' + EJSON.stringify(r).slice(0, 80)); }
+catch (e) { print('DENIED ' + (e.codeName || e.message)); }" 2>&1)
+case $out in
+  *'Authentication failed'*) out=AUTH_FAILED ;;
+esac
+echo "$user | $js | $out"

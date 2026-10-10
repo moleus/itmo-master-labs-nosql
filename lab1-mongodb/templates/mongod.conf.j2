@@ -1,0 +1,19 @@
+# {{ ansible_managed }}
+# Документация: https://www.mongodb.com/docs/manual/reference/configuration-options/
+storage:
+  dbPath: /var/lib/mongodb
+  wiredTiger:
+    engineConfig:
+      cacheSizeGB: {{ mongo_cache_gb }}
+systemLog:
+  destination: file
+  logAppend: true
+  path: /var/log/mongodb/mongod.log
+net:
+  port: {{ mongo_port }}
+  bindIp: 127.0.0.1{% if mongo_bind_ip != '127.0.0.1' %},{{ mongo_bind_ip }}{% endif %}
+
+processManagement:
+  timeZoneInfo: /usr/share/zoneinfo
+security:
+  authorization: enabled
