@@ -1,0 +1,407 @@
+# Часть 4. Мониторинг: mongodb_exporter -> VictoriaMetrics -> Grafana.
+# Нужна часть 1 (MongoDB, база shop).
+#
+# Весь сценарий:      ansible-playbook 04-monitoring.yml
+# Один шаг:           ansible-playbook 04-monitoring.yml -t load
+#
+# Шаги (теги) по пунктам задания:
+#   exporter         поставить mongodb_exporter (Percona) и node_exporter
+#   victoriametrics  поставить VictoriaMetrics single, собирать метрики обоих экспортеров
+#   grafana          поставить Grafana, источник данных VictoriaMetrics
+#   metrics          показать текущие значения выбранных метрик
+#   dashboard        загрузить дашборды в Grafana
+#   load             дать нагрузку на shop и сравнить метрики до и во время нагрузки
+#
+#   mongod :27017 <-- mongodb_exporter :9216 --+
+#   ОС            <-- node_exporter    :9100 --+--> VictoriaMetrics :8428 <-- Grafana :3000
+#
+# Grafana: http://<IP ВМ>:3000, admin / grafana_admin_password, просмотр без логина.
+
+- name: "Part 4: monitoring"
+  hosts: mongo
+  gather_facts: true
+
+  vars:
+    vm_url: http://127.0.0.1:8428
+    grafana_url: "http://{{ ansible_host }}:3000"
+    load_workers: 4
+    load_seconds: 180
+    # Выбранные метрики: название -> PromQL. $w = окно (5m для шага metrics,
+    # длина нагрузки для шага load). Те же выражения стоят в дашборде MongoDB lab.
+    lab_metrics:
+      - { name: "mongod up (1 = ok)", expr: "mongodb_up" }
+      - { name: "uptime, s", expr: "mongodb_instance_uptime_seconds" }
+      - { name: "connections current, max", expr: "max_over_time(mongodb_ss_connections{conn_type='current'}[$w])" }
+      - { name: "operations/s", expr: "sum(rate(mongodb_ss_opcounters[$w]))" }
+      - { name: "documents inserted/s", expr: "rate(mongodb_ss_metrics_document{doc_op_type='inserted'}[$w])" }
+      - { name: "documents returned/s", expr: "rate(mongodb_ss_metrics_document{doc_op_type='returned'}[$w])" }
+      - { name: "collection scans/s", expr: "rate(mongodb_ss_metrics_queryExecutor_collectionScans_total[$w])" }
+      - name: "scanned docs per returned doc"
+        expr: >-
+          sum(increase(mongodb_ss_metrics_queryExecutor_scannedObjects[$w]))
+          / clamp_min(sum(increase(mongodb_ss_metrics_document{doc_op_type='returned'}[$w])), 1)
+      - { name: "read latency avg, ms", expr: "increase(mongodb_ss_opLatencies_latency{op_type='reads'}[$w]) / clamp_min(increase(mongodb_ss_opLatencies_ops{op_type='reads'}[$w]), 1) / 1000" }
+      - { name: "write latency avg, ms", expr: "increase(mongodb_ss_opLatencies_latency{op_type='writes'}[$w]) / clamp_min(increase(mongodb_ss_opLatencies_ops{op_type='writes'}[$w]), 1) / 1000" }
+      - { name: "WT cache used max, %", expr: "max_over_time((100 * mongodb_ss_wt_cache_bytes_currently_in_the_cache / mongodb_ss_wt_cache_maximum_bytes_configured)[$w:10s])" }
+      - { name: "WT cache dirty max, %", expr: "max_over_time((100 * mongodb_ss_wt_cache_tracked_dirty_bytes_in_the_cache / mongodb_ss_wt_cache_maximum_bytes_configured)[$w:10s])" }
+      - { name: "WT pages read into cache/s", expr: "rate(mongodb_ss_wt_cache_pages_read_into_cache[$w])" }
+      - { name: "WT pages evicted/s", expr: "rate(mongodb_ss_wt_cache_unmodified_pages_evicted[$w]) + rate(mongodb_ss_wt_cache_modified_pages_evicted[$w])" }
+      - { name: "write tickets in use, max", expr: "max_over_time(mongodb_ss_wt_concurrentTransactions_out{txn_rw='write'}[$w])" }
+      - { name: "journal MB/s", expr: "rate(mongodb_ss_wt_log_log_bytes_written[$w]) / 1048576" }
+      - { name: "resident memory max, MB", expr: "max_over_time(mongodb_ss_mem_resident[$w])" }
+      - { name: "db shop data size, MB", expr: "max_over_time(mongodb_dbstats_dataSize{database='shop'}[$w]) / 1048576" }
+      - { name: "host CPU busy, %", expr: "100 * (1 - avg(rate(node_cpu_seconds_total{mode='idle'}[$w])))" }
+
+  tasks:
+    # --- exporter -----------------------------------------------------------
+    - name: "exporter: mongo user with clusterMonitor"
+      ansible.builtin.command:
+        argv:
+          - mongo-admin
+          - admin
+          - |
+            if (db.getUser('{{ exporter_user }}')) print('exists');
+            else {
+              db.createUser({ user: '{{ exporter_user }}', pwd: '{{ exporter_password }}',
+                              roles: [{ role: 'clusterMonitor', db: 'admin' }, { role: 'read', db: 'local' }] });
+              print('created');
+            }
+      register: out
+      changed_when: "'created' in out.stdout"
+      tags: exporter
+
+    - name: "exporter: system user"
+      ansible.builtin.user:
+        name: mongodb_exporter
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+      tags: exporter
+
+    - name: "exporter: download mongodb_exporter {{ exporter_version }}"
+      ansible.builtin.unarchive:
+        src: "https://github.com/percona/mongodb_exporter/releases/download/v{{ exporter_version }}/mongodb_exporter-{{ exporter_version }}.linux-{{ release_arch }}.tar.gz"
+        dest: /usr/local/bin
+        remote_src: true
+        extra_opts: [--strip-components=1, --wildcards, "*/mongodb_exporter"]
+        creates: /usr/local/bin/mongodb_exporter
+      register: download
+      until: download is succeeded
+      retries: 5
+      delay: 10
+      tags: exporter
+
+    - name: "exporter: config and unit"
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode }}"
+        owner: "{{ item.owner | default('root') }}"
+      loop:
+        - { src: templates/mongodb_exporter.env.j2, dest: /etc/mongodb_exporter.env, mode: "0600" }
+        - { src: templates/mongodb_exporter.service.j2, dest: /etc/systemd/system/mongodb_exporter.service, mode: "0644" }
+      loop_control:
+        label: "{{ item.dest }}"
+      register: exporter_files
+      tags: exporter
+
+    - name: "exporter: start mongodb_exporter"
+      ansible.builtin.systemd_service:
+        name: mongodb_exporter
+        enabled: true
+        state: "{{ 'restarted' if exporter_files.changed else 'started' }}"
+        daemon_reload: true
+      tags: exporter
+
+    - name: "exporter: node_exporter for host metrics"
+      ansible.builtin.apt:
+        name: prometheus-node-exporter
+      tags: exporter
+
+    - name: "exporter: start node_exporter"
+      ansible.builtin.systemd_service:
+        name: prometheus-node-exporter
+        enabled: true
+        state: started
+      tags: exporter
+
+    - name: "exporter: check /metrics"
+      ansible.builtin.shell: |
+        # Сразу после старта экспортер отдаёт только часть метрик: ждём serverStatus (mongodb_ss_*).
+        for i in $(seq 30); do
+          curl -sf localhost:9216/metrics >/tmp/m.9216 && grep -q '^mongodb_ss_connections{' /tmp/m.9216 && break
+          sleep 1
+        done
+        for i in $(seq 30); do curl -sf localhost:9100/metrics >/tmp/m.9100 && break; sleep 1; done
+        echo "mongodb_exporter :9216: $(grep -vc '^#' /tmp/m.9216) series, $(grep '^mongodb_up' /tmp/m.9216)"
+        echo "  $(grep -m1 '^mongodb_ss_connections{.*conn_type="current"' /tmp/m.9216)"
+        echo "  $(grep -m1 '^mongodb_ss_opcounters{.*legacy_op_type="insert"' /tmp/m.9216)"
+        echo "node_exporter :9100: $(grep -vc '^#' /tmp/m.9100) series"
+      register: out
+      changed_when: false
+      failed_when: "'} 1' not in out.stdout_lines[0]"
+      tags: exporter
+
+    - name: "exporter: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: exporter
+
+    # --- victoriametrics ----------------------------------------------------
+    - name: "victoriametrics: system user"
+      ansible.builtin.user:
+        name: victoriametrics
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+      tags: victoriametrics
+
+    - name: "victoriametrics: download v{{ vm_version }}"
+      ansible.builtin.unarchive:
+        src: "https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v{{ vm_version }}/victoria-metrics-linux-{{ release_arch }}-v{{ vm_version }}.tar.gz"
+        dest: /usr/local/bin
+        remote_src: true
+        creates: /usr/local/bin/victoria-metrics-prod
+      register: download
+      until: download is succeeded
+      retries: 5
+      delay: 10
+      tags: victoriametrics
+
+    - name: "victoriametrics: directories"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+        owner: victoriametrics
+      loop: [/var/lib/victoria-metrics, /etc/victoria-metrics]
+      tags: victoriametrics
+
+    # validate: конфиг проверяет сам VictoriaMetrics (-promscrape.config.dryRun),
+    # битый файл не попадёт на место.
+    - name: "victoriametrics: scrape config, checked by dryRun"
+      ansible.builtin.template:
+        src: templates/scrape.yml.j2
+        dest: /etc/victoria-metrics/scrape.yml
+        mode: "0644"
+        validate: /usr/local/bin/victoria-metrics-prod -promscrape.config=%s -promscrape.config.dryRun
+      register: vm_scrape
+      tags: victoriametrics
+
+    - name: "victoriametrics: systemd unit"
+      ansible.builtin.template:
+        src: templates/victoriametrics.service.j2
+        dest: /etc/systemd/system/victoriametrics.service
+        mode: "0644"
+      register: vm_unit
+      tags: victoriametrics
+
+    - name: "victoriametrics: start"
+      ansible.builtin.systemd_service:
+        name: victoriametrics
+        enabled: true
+        state: "{{ 'restarted' if (vm_scrape.changed or vm_unit.changed) else 'started' }}"
+        daemon_reload: true
+      tags: victoriametrics
+
+    - name: "victoriametrics: check all targets are up"
+      ansible.builtin.shell: |
+        set -o pipefail
+        # Первый сбор метрик через scrape_interval после старта: ждём, пока все цели up = 1.
+        for i in $(seq 60); do
+          r=$(curl -s '{{ vm_url }}/api/v1/query?query=up' | python3 -c '
+        import json, sys
+        for x in json.load(sys.stdin)["data"]["result"]:
+            print(x["metric"]["job"] + ": up = " + x["value"][1])')
+          [ $(echo "$r" | grep -c 'up = 1') -eq 3 ] && break
+          sleep 2
+        done
+        echo "$r"
+      args:
+        executable: /bin/bash
+      register: out
+      changed_when: false
+      failed_when: out.stdout_lines | select('search', 'up = 1') | list | length != 3
+      tags: victoriametrics
+
+    - name: "victoriametrics: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: victoriametrics
+
+    # --- grafana ------------------------------------------------------------
+    # apt.grafana.com отвечает 403 из РФ. Пакет с dl.grafana.com/oss/release/ скачивается.
+    - name: "grafana: dependencies"
+      ansible.builtin.apt:
+        name: [adduser, libfontconfig1, musl]
+      tags: grafana
+
+    - name: "grafana: install from dl.grafana.com, version {{ grafana_version }}"
+      ansible.builtin.apt:
+        deb: "https://dl.grafana.com/oss/release/grafana_{{ grafana_version }}_{{ release_arch }}.deb"
+      register: download
+      until: download is succeeded
+      retries: 5
+      delay: 10
+      tags: grafana
+
+    - name: "grafana: directories"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: [/etc/systemd/system/grafana-server.service.d, /var/lib/grafana/dashboards]
+      tags: grafana
+
+    - name: "grafana: settings, datasource, dashboard provider"
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "0644"
+      loop:
+        - { src: templates/grafana-override.conf.j2, dest: /etc/systemd/system/grafana-server.service.d/override.conf }
+        - { src: files/grafana-datasource.yml, dest: /etc/grafana/provisioning/datasources/victoriametrics.yml }
+        - { src: files/grafana-dashboards.yml, dest: /etc/grafana/provisioning/dashboards/lab.yml }
+      loop_control:
+        label: "{{ item.dest }}"
+      register: grafana_files
+      tags: grafana
+
+    - name: "grafana: start"
+      ansible.builtin.systemd_service:
+        name: grafana-server
+        enabled: true
+        state: "{{ 'restarted' if grafana_files.changed else 'started' }}"
+        daemon_reload: true
+      tags: grafana
+
+    - name: "grafana: check datasource"
+      ansible.builtin.shell: |
+        # Grafana стартует ~20-30 с: ждём ответа API без лишних строк в выводе.
+        for i in $(seq 60); do
+          r=$(curl -sf -u 'admin:{{ grafana_admin_password }}' \
+            http://127.0.0.1:3000/api/datasources/uid/victoriametrics/health) && break
+          sleep 2
+        done
+        echo "$r"
+      register: ds
+      changed_when: false
+      failed_when: (ds.stdout | from_json).status | default('') != 'OK'
+      tags: grafana
+
+    - name: "grafana: result"
+      ansible.builtin.debug:
+        msg:
+          - "grafana: {{ grafana_url }} (admin / {{ grafana_admin_password }})"
+          - "datasource VictoriaMetrics: {{ (ds.stdout | from_json).status }}, {{ (ds.stdout | from_json).message }}"
+      tags: grafana
+
+    # --- metrics ------------------------------------------------------------
+    - name: "metrics: copy metric list and vmquery.py"
+      ansible.builtin.copy:
+        content: "{{ item.content | default(omit) }}"
+        src: "{{ item.src | default(omit) }}"
+        dest: "{{ item.dest }}"
+        mode: "0755"
+      loop:
+        - { content: "{{ lab_metrics | to_nice_json }}", dest: /opt/mongo-lab/metrics.json }
+        - { src: files/vmquery.py, dest: /opt/mongo-lab/vmquery.py }
+      loop_control:
+        label: "{{ item.dest }}"
+      tags: [metrics, load]
+
+    - name: "metrics: query selected metrics (last 5 min)"
+      ansible.builtin.command: /opt/mongo-lab/vmquery.py /opt/mongo-lab/metrics.json
+      register: out
+      changed_when: false
+      failed_when: "'no data' in out.stdout"
+      tags: metrics
+
+    - name: "metrics: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: metrics
+
+    # --- dashboard ----------------------------------------------------------
+    - name: "dashboard: copy dashboards"
+      ansible.builtin.copy:
+        src: "files/dashboards/{{ item }}"
+        dest: "/var/lib/grafana/dashboards/{{ item }}"
+        mode: "0644"
+      loop: [mongodb-lab.json, mongodb-12079.json]
+      tags: dashboard
+
+    - name: "dashboard: check grafana loaded them"
+      ansible.builtin.shell: |
+        # Grafana перечитывает папку с дашбордами раз в 10 с.
+        set -o pipefail
+        for i in $(seq 30); do
+          r=$(curl -sf -u 'admin:{{ grafana_admin_password }}' 'http://127.0.0.1:3000/api/search?type=dash-db')
+          [ "$(echo "$r" | grep -o '"uid"' | wc -l)" -ge 2 ] && break
+          sleep 1
+        done
+        echo "$r"
+      args:
+        executable: /bin/bash
+      register: dash
+      changed_when: false
+      failed_when: (dash.stdout | from_json) | length < 2
+      tags: dashboard
+
+    - name: "dashboard: result"
+      ansible.builtin.debug:
+        msg: "{{ (dash.stdout | from_json) | map(attribute='title') | zip((dash.stdout | from_json) | map(attribute='url') | map('regex_replace', '^', grafana_url)) | map('join', ': ') | list }}"
+      tags: dashboard
+
+    # --- load ---------------------------------------------------------------
+    - name: "load: user loadgen, capped collection shop.events"
+      ansible.builtin.command:
+        argv:
+          - mongo-admin
+          - shop
+          - |
+            if (db.getUser('loadgen')) print('exists');
+            else { db.createUser({ user: 'loadgen', pwd: 'loadgen-pass', roles: ['readWrite'] }); print('created'); }
+            if (!db.getCollectionNames().includes('events'))
+              db.createCollection('events', { capped: true, size: 1024 * 1024 * 1024 });
+      register: out
+      changed_when: "'created' in out.stdout"
+      tags: load
+
+    - name: "load: copy load.js"
+      ansible.builtin.copy:
+        src: files/load.js
+        dest: /opt/mongo-lab/load.js
+        mode: "0644"
+      tags: load
+
+    - name: "load: run workers, watch Grafana now"
+      ansible.builtin.shell: |
+        start=$(date +%s)
+        for i in $(seq {{ load_workers }}); do
+          LOAD_SECONDS={{ load_seconds }} mongosh --quiet "mongodb://loadgen:loadgen-pass@127.0.0.1:{{ mongo_port }}/shop" \
+            /opt/mongo-lab/load.js &
+        done
+        wait
+        echo "$start $(date +%s)"
+      register: load
+      changed_when: true
+      tags: load
+
+    - name: "load: wait one scrape"
+      ansible.builtin.pause:
+        seconds: 15
+      tags: load
+
+    - name: "load: compare metrics before / during load"
+      ansible.builtin.command: /opt/mongo-lab/vmquery.py /opt/mongo-lab/metrics.json {{ load.stdout_lines[-1] }}
+      register: out
+      changed_when: false
+      tags: load
+
+    - name: "load: result"
+      ansible.builtin.debug:
+        msg: "{{ load.stdout_lines[:-1] + out.stdout_lines + ['grafana: ' ~ grafana_url ~ '/d/mongodb-lab?from=' ~ (t[0] | int - 300) ~ '000&to=' ~ (t[1] | int + 120) ~ '000'] }}"
+      vars:
+        t: "{{ load.stdout_lines[-1].split() }}"
+      tags: load

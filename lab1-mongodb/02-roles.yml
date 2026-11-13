@@ -1,0 +1,281 @@
+# Часть 2. Ролевая модель MongoDB.
+# Нужна часть 1 (MongoDB с авторизацией и база shop).
+#
+# Весь сценарий:      ansible-playbook 02-roles.yml
+# Один шаг:           ansible-playbook 02-roles.yml -t grant
+#
+# Шаги (теги) по пунктам задания:
+#   users              создать пользователей alice, bob, carol (пока без ролей)
+#   roles              создать роли shopReader и orderWriter
+#   grant              назначить роли пользователям
+#   revoke             отозвать роль у пользователя
+#   role-change        изменить набор операций у роли orderWriter
+#   collection-access  дать carol доступ только к коллекции shop.customers
+#   drop               удалить роль и пользователя
+#
+# Шаги users и roles при повторном запуске возвращают пользователей и роли
+# в исходное состояние, поэтому весь сценарий можно прогонять снова.
+#
+# Каждый шаг после действия проверяет права: выполняет операции под
+# пользователем (mongo-try) и сравнивает результат с ожидаемым.
+
+- name: "Part 2: roles"
+  hosts: mongo
+  gather_facts: false
+
+  vars:
+    # Исходные наборы прав. collection: "" = все коллекции базы.
+    lab_roles:
+      shopReader:
+        - resource: { db: shop, collection: "" }
+          actions: [find, listCollections, collStats, dbStats]
+      orderWriter:
+        - resource: { db: shop, collection: orders }
+          actions: [find, insert, update]
+    collection_role:
+      customersViewer:
+        - resource: { db: shop, collection: customers }
+          actions: [find]
+    # Начало каждого вызова mongo-admin: подключить helpers.js.
+    js: "load('/opt/mongo-lab/helpers.js');"
+
+  tasks:
+    - name: "copy helpers.js"
+      ansible.builtin.copy:
+        src: files/helpers.js
+        dest: /opt/mongo-lab/helpers.js
+        mode: "0644"
+      tags: always
+
+    # --- users ------------------------------------------------------------
+    - name: "users: create alice, bob, carol in db shop"
+      ansible.builtin.command:
+        argv:
+          - mongo-admin
+          - shop
+          - |
+            {{ js }}
+            const users = {{ lab_users | to_json }};
+            for (const [name, u] of Object.entries(users)) {
+              // Повторный запуск: сбросить роли, чтобы сценарий шёл с начала.
+              if (db.getUser(name)) { db.updateUser(name, { roles: [] }); print(`user ${name}: exists, roles reset`); continue; }
+              db.createUser({ user: name, pwd: u.password, roles: [] });
+              print(`user ${name}: created`);
+            }
+            Object.keys(users).forEach(showUser);
+      register: out
+      changed_when: "': created' in out.stdout"
+      tags: users
+
+    - name: "users: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: users
+
+    - name: "users: check login works, data is closed"
+      ansible.builtin.import_tasks: tasks/check-access.yml
+      vars:
+        step: users
+        checks:
+          - { user: alice, op: "db.runCommand({connectionStatus: 1}).authInfo.authenticatedUsers", expect: ALLOWED }
+          - { user: alice, op: "db.products.findOne()", expect: DENIED }
+          - { user: bob, op: "db.orders.findOne()", expect: DENIED }
+      tags: users
+
+    # --- roles ------------------------------------------------------------
+    - name: "roles: create shopReader, orderWriter"
+      ansible.builtin.command:
+        argv:
+          - mongo-admin
+          - shop
+          - |
+            {{ js }}
+            const roles = {{ lab_roles | to_json }};
+            for (const [name, privs] of Object.entries(roles)) ensureRole(name, privs);
+            Object.keys(roles).forEach(showRole);
+      register: out
+      changed_when: "': created' in out.stdout"
+      tags: roles
+
+    - name: "roles: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: roles
+
+    # --- grant ------------------------------------------------------------
+    - name: "grant: shopReader -> alice, orderWriter -> bob"
+      ansible.builtin.command:
+        argv:
+          - mongo-admin
+          - shop
+          - |
+            {{ js }}
+            grant('alice', 'shopReader');
+            grant('bob', 'orderWriter');
+            ['alice', 'bob'].forEach(showUser);
+      register: out
+      changed_when: "'granted' in out.stdout"
+      tags: grant
+
+    - name: "grant: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: grant
+
+    - name: "grant: check"
+      ansible.builtin.import_tasks: tasks/check-access.yml
+      vars:
+        step: grant
+        checks:
+          - { user: alice, op: "db.products.findOne().name", expect: ALLOWED }
+          - { user: alice, op: "db.products.insertOne({name: 'x'})", expect: DENIED }
+          - { user: bob, op: "db.orders.insertOne({by: 'bob', total: 1}).acknowledged", expect: ALLOWED }
+          - { user: bob, op: "db.orders.deleteMany({by: 'bob'})", expect: DENIED }
+          - { user: bob, op: "db.products.findOne()", expect: DENIED }
+      tags: grant
+
+    # --- revoke -----------------------------------------------------------
+    - name: "revoke: shopReader from alice"
+      ansible.builtin.command:
+        argv:
+          - mongo-admin
+          - shop
+          - |
+            {{ js }}
+            revoke('alice', 'shopReader');
+            showUser('alice');
+      register: out
+      changed_when: "'revoked' in out.stdout"
+      tags: revoke
+
+    - name: "revoke: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: revoke
+
+    - name: "revoke: check"
+      ansible.builtin.import_tasks: tasks/check-access.yml
+      vars:
+        step: revoke
+        checks:
+          - { user: alice, op: "db.products.findOne()", expect: DENIED }
+      tags: revoke
+
+    # --- role-change ------------------------------------------------------
+    - name: "role-change: orderWriter +remove -update"
+      ansible.builtin.command:
+        argv:
+          - mongo-admin
+          - shop
+          - |
+            {{ js }}
+            const orders = { db: 'shop', collection: 'orders' };
+            showRole('orderWriter');
+            db.grantPrivilegesToRole('orderWriter', [{ resource: orders, actions: ['remove'] }]);
+            db.revokePrivilegesFromRole('orderWriter', [{ resource: orders, actions: ['update'] }]);
+            showRole('orderWriter');
+      register: out
+      changed_when: out.stdout_lines[0] != out.stdout_lines[1]
+      tags: role-change
+
+    - name: "role-change: result (before, after)"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: role-change
+
+    - name: "role-change: check"
+      ansible.builtin.import_tasks: tasks/check-access.yml
+      vars:
+        step: role-change
+        checks:
+          - { user: bob, op: "db.orders.insertOne({by: 'bob', total: 1}).acknowledged", expect: ALLOWED }
+          - { user: bob, op: "db.orders.deleteMany({by: 'bob'})", expect: ALLOWED }
+          - { user: bob, op: "db.orders.updateOne({_id: 1}, {$set: {status: 'paid'}})", expect: DENIED }
+      tags: role-change
+
+    # --- collection-access ------------------------------------------------
+    - name: "collection-access: role customersViewer -> carol"
+      ansible.builtin.command:
+        argv:
+          - mongo-admin
+          - shop
+          - |
+            {{ js }}
+            ensureRole('customersViewer', {{ collection_role.customersViewer | to_json }});
+            grant('carol', 'customersViewer');
+            showRole('customersViewer');
+            showUser('carol');
+      register: out
+      changed_when: "'created' in out.stdout or 'granted' in out.stdout"
+      tags: collection-access
+
+    - name: "collection-access: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: collection-access
+
+    - name: "collection-access: check"
+      ansible.builtin.import_tasks: tasks/check-access.yml
+      vars:
+        step: collection-access
+        checks:
+          - { user: carol, op: "db.customers.findOne().email", expect: ALLOWED }
+          - { user: carol, op: "db.customers.insertOne({name: 'x'})", expect: DENIED }
+          - { user: carol, op: "db.orders.findOne()", expect: DENIED }
+          - { user: carol, op: "db.products.findOne()", expect: DENIED }
+          - { user: carol, op: "db.getCollectionNames()", expect: DENIED }
+      tags: collection-access
+
+    # --- drop -------------------------------------------------------------
+    - name: "drop: role customersViewer"
+      ansible.builtin.command:
+        argv:
+          - mongo-admin
+          - shop
+          - |
+            {{ js }}
+            if (db.getRole('customersViewer')) { db.dropRole('customersViewer'); print('role customersViewer: dropped'); }
+            showRole('customersViewer');
+            showUser('carol');
+      register: out
+      changed_when: "'dropped' in out.stdout"
+      tags: drop
+
+    - name: "drop: result (role)"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: drop
+
+    - name: "drop: check carol lost access with the role"
+      ansible.builtin.import_tasks: tasks/check-access.yml
+      vars:
+        step: drop
+        checks:
+          - { user: carol, op: "db.customers.findOne()", expect: DENIED }
+      tags: drop
+
+    - name: "drop: user carol"
+      ansible.builtin.command:
+        argv:
+          - mongo-admin
+          - shop
+          - |
+            {{ js }}
+            if (db.getUser('carol')) { db.dropUser('carol'); print('user carol: dropped'); }
+            showUser('carol');
+      register: out
+      changed_when: "'dropped' in out.stdout"
+      tags: drop
+
+    - name: "drop: result (user)"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: drop
+
+    - name: "drop: check carol cannot log in"
+      ansible.builtin.import_tasks: tasks/check-access.yml
+      vars:
+        step: drop
+        checks:
+          - { user: carol, op: "db.customers.findOne()", expect: AUTH_FAILED }
+      tags: drop

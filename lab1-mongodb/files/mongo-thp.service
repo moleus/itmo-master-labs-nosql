@@ -1,0 +1,15 @@
+# Настройки Transparent Huge Pages для MongoDB 8.0 (новый TCMalloc).
+# https://www.mongodb.com/docs/manual/administration/tcmalloc-performance/
+[Unit]
+Description=THP settings for MongoDB
+Before=mongod.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'echo always > /sys/kernel/mm/transparent_hugepage/enabled'
+ExecStart=/bin/sh -c 'echo defer+madvise > /sys/kernel/mm/transparent_hugepage/defrag'
+ExecStart=/bin/sh -c 'echo 0 > /sys/kernel/mm/transparent_hugepage/khugepaged/max_ptes_none'
+
+[Install]
+WantedBy=multi-user.target

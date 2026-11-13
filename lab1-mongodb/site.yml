@@ -1,0 +1,9 @@
+# Все четыре части подряд: ansible-playbook site.yml
+- name: Part 1
+  ansible.builtin.import_playbook: 01-base.yml
+- name: Part 2
+  ansible.builtin.import_playbook: 02-roles.yml
+- name: Part 3
+  ansible.builtin.import_playbook: 03-backup.yml
+- name: Part 4
+  ansible.builtin.import_playbook: 04-monitoring.yml

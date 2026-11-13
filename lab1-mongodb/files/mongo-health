@@ -1,0 +1,27 @@
+#!/bin/bash
+# mongo-health — проверить, что mongod доступен, и напечатать отчёт.
+# Код выхода: 0 = OK, 1 = FAIL.
+# shellcheck source=/dev/null  # файл создаёт Ansible на ВМ
+. /etc/mongo-admin.env
+rc=0
+state=$(systemctl is-active mongod)
+echo "service mongod: $state"
+[ "$state" = active ] || rc=1
+if timeout 2 bash -c '</dev/tcp/127.0.0.1/27017' 2>/dev/null; then
+  echo "port 27017: open"
+else
+  echo "port 27017: closed"
+  rc=1
+fi
+# shellcheck disable=SC2016  # ${...} внутри -- шаблонная строка JavaScript, а не shell
+if info=$(timeout 10 mongosh --quiet "mongodb://127.0.0.1:27017/admin" \
+  -u "$MONGO_ADMIN_USER" -p "$MONGO_ADMIN_PASSWORD" --authenticationDatabase admin --eval '
+const s = db.serverStatus();
+print(`ping: ok, version ${s.version}, uptime ${s.uptime} s, connections ${s.connections.current}`)' 2>&1); then
+  echo "$info"
+else
+  echo "ping: failed"
+  rc=1
+fi
+[ $rc -eq 0 ] && echo "RESULT: OK" || echo "RESULT: FAIL"
+exit $rc

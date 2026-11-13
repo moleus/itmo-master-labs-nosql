@@ -1,0 +1,24 @@
+# Проверка прав: каждая операция выполняется под своим пользователем
+# через mongo-try. Шаг падает, если результат не совпал с ожидаемым.
+# Вход:
+#   step    имя шага (тег), попадает в имя задачи
+#   checks  список {user, op, expect}, expect = ALLOWED | DENIED | AUTH_FAILED
+
+- name: "{{ step }}: check access"
+  ansible.builtin.command:
+    argv:
+      - mongo-try
+      - "{{ item.user }}"
+      - "{{ lab_users[item.user].password }}"
+      - shop
+      - "{{ item.op }}"
+  loop: "{{ checks }}"
+  loop_control:
+    label: "{{ item.user }}: {{ item.op }} -> expect {{ item.expect }}"
+  register: access
+  changed_when: false
+  failed_when: (' | ' ~ item.expect) not in access.stdout
+
+- name: "{{ step }}: access result"
+  ansible.builtin.debug:
+    msg: "{{ access.results | map(attribute='stdout') | list }}"

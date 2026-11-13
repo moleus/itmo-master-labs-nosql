@@ -1,0 +1,372 @@
+# Часть 3. Резервное копирование и восстановление.
+# Нужна часть 1 (MongoDB, базы shop и school).
+#
+# Весь сценарий:      ansible-playbook 03-backup.yml
+# Один шаг:           ansible-playbook 03-backup.yml -t restore
+#
+# Шаги (теги) по пунктам задания:
+#   backup-one      копия одной базы (backup_db, по умолчанию shop)
+#   backup-all      копия всех учебных баз (shop, school)
+#   backup-history  новая копия не перезаписывает старую
+#   restore         удалить коллекцию shop.orders и восстановить её из копии
+#   schedule        копии по расписанию через cron, старые копии удаляются
+#   restore-date    восстановить базу из копии на заданную дату:
+#                   ansible-playbook 03-backup.yml -t restore-date -e restore_date=20261103T1700
+#                   Без restore_date: дата = now(), и шаг сам показывает возврат к копии.
+#
+# Копии делает скрипт mongo-backup (files/mongo-backup) под пользователем
+# backup со встроенными ролями backup и restore.
+# Каждая копия -- новая папка /var/backups/mongodb/<имя>-<время>/.
+
+- name: "Part 3: backup and restore"
+  hosts: mongo
+  gather_facts: false
+
+  tasks:
+    # --- setup, выполняется при любом теге ---------------------------------
+    - name: "setup: backup user with roles backup, restore"
+      ansible.builtin.command:
+        argv:
+          - mongo-admin
+          - admin
+          - |
+            if (db.getUser('{{ backup_user }}')) print('exists');
+            else {
+              db.createUser({ user: '{{ backup_user }}', pwd: '{{ backup_password }}',
+                              roles: ['backup', 'restore'] });
+              print('created');
+            }
+      register: out
+      changed_when: "'created' in out.stdout"
+      tags: always
+
+    - name: "setup: script mongo-backup"
+      ansible.builtin.copy:
+        src: files/mongo-backup
+        dest: /usr/local/bin/mongo-backup
+        mode: "0755"
+      tags: always
+
+    - name: "setup: backup credentials"
+      ansible.builtin.template:
+        src: templates/mongo-backup.env.j2
+        dest: /etc/mongo-backup.env
+        mode: "0600"
+      tags: always
+
+    - name: "setup: backup dir"
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: "0700"
+      tags: always
+
+    # --- backup-one ---------------------------------------------------------
+    - name: "backup-one: mongodump db {{ backup_db }}"
+      ansible.builtin.command: mongo-backup {{ backup_db }} {{ backup_db }}
+      register: one
+      changed_when: true   # каждый запуск -- новое действие
+      tags: backup-one
+
+    - name: "backup-one: check archive"
+      ansible.builtin.shell: |
+        set -o pipefail
+        ls -l {{ one.stdout }} | tail -n +2 | awk '{print $NF ": " $5 " bytes"}' | sed "s|^|{{ one.stdout }}/|"
+        . /etc/mongo-backup.env
+        mongorestore --dryRun -v --gzip --archive={{ one.stdout }}/{{ backup_db }}.archive.gz \
+          -u "$BACKUP_USER" -p "$BACKUP_PASSWORD" --authenticationDatabase admin 2>&1 \
+          | grep -o 'archive prelude .*' | tr -d '`' | sed 's/archive prelude /  collection in archive: /'
+      args:
+        executable: /bin/bash
+      register: out
+      changed_when: false
+      failed_when: "('archive: ' ~ backup_db ~ '.') not in out.stdout"
+      tags: backup-one
+
+    - name: "backup-one: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: backup-one
+
+    # --- backup-all ---------------------------------------------------------
+    - name: "backup-all: mongodump {{ lab_dbs | join(', ') }}"
+      ansible.builtin.command: mongo-backup all {{ lab_dbs | join(' ') }}
+      register: all
+      changed_when: true   # каждый запуск -- новое действие
+      tags: backup-all
+
+    - name: "backup-all: check archives"
+      ansible.builtin.shell: |
+        set -o pipefail
+        ls -l {{ all.stdout }} | tail -n +2 | awk '{print $NF ": " $5 " bytes"}' | sed "s|^|{{ all.stdout }}/|"
+      args:
+        executable: /bin/bash
+      register: out
+      changed_when: false
+      failed_when: out.stdout_lines | length != lab_dbs | length
+      tags: backup-all
+
+    - name: "backup-all: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: backup-all
+
+    # --- backup-history -----------------------------------------------------
+    - name: "backup-history: last copy before new backup"
+      ansible.builtin.shell: |
+        set -o pipefail
+        last=$(ls -1d {{ backup_dir }}/{{ backup_db }}-* | tail -1)
+        echo "$last"
+        sha256sum "$last/{{ backup_db }}.archive.gz" | cut -c1-16
+        ls -1d {{ backup_dir }}/{{ backup_db }}-* | wc -l
+      args:
+        executable: /bin/bash
+      register: before
+      changed_when: false
+      tags: backup-history
+
+    - name: "backup-history: new backup of {{ backup_db }}"
+      ansible.builtin.shell: sleep 1 && mongo-backup {{ backup_db }} {{ backup_db }}
+      register: new
+      changed_when: true   # каждый запуск -- новое действие
+      tags: backup-history
+
+    - name: "backup-history: check old copy is untouched"
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "copies of {{ backup_db }} before: {{ before.stdout_lines[2] }}, after: $(ls -1d {{ backup_dir }}/{{ backup_db }}-* | wc -l)"
+        echo "new copy: {{ new.stdout }}"
+        echo "old copy: {{ before.stdout_lines[0] }}"
+        old=$(sha256sum {{ before.stdout_lines[0] }}/{{ backup_db }}.archive.gz | cut -c1-16)
+        echo "old sha256 before: {{ before.stdout_lines[1] }}, after: $old"
+        [ "$old" = "{{ before.stdout_lines[1] }}" ] || echo "OLD COPY CHANGED"
+        echo "all copies:"
+        du -sh {{ backup_dir }}/* | awk '{print "  " $2 "  " $1}'
+      args:
+        executable: /bin/bash
+      register: out
+      changed_when: false
+      failed_when: "'OLD COPY CHANGED' in out.stdout or new.stdout == before.stdout_lines[0]"
+      tags: backup-history
+
+    - name: "backup-history: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: backup-history
+
+    # --- restore ------------------------------------------------------------
+    - name: "restore: snapshot of shop.orders before"
+      ansible.builtin.command: &orders_state
+        argv:
+          - mongo-admin
+          - shop
+          - |
+            const exists = db.getCollectionNames().includes('orders');
+            const md5 = exists ? db.runCommand({ dbHash: 1, collections: ['orders'] }).collections.orders : '-';
+            const idx = exists ? db.orders.getIndexes().map(i => i.name).join(', ') : '-';
+            print(`orders: ${db.orders.countDocuments()} docs, md5 ${md5}, indexes [${idx}]`);
+      register: before
+      changed_when: false
+      tags: restore
+
+    - name: "restore: fresh backup of shop"
+      ansible.builtin.command: mongo-backup shop shop
+      register: copy
+      changed_when: true   # каждый запуск -- новое действие
+      tags: restore
+
+    - name: "restore: drop collection shop.orders"
+      ansible.builtin.command:
+        argv: [mongo-admin, shop, "db.orders.drop()"]
+      changed_when: true   # каждый запуск -- новое действие
+      tags: restore
+
+    - name: "restore: state after drop"
+      ansible.builtin.command: *orders_state
+      register: dropped
+      changed_when: false
+      tags: restore
+
+    - name: "restore: mongorestore shop.orders"
+      ansible.builtin.shell: |
+        set -o pipefail
+        . /etc/mongo-backup.env
+        mongorestore --gzip --archive={{ copy.stdout }}/shop.archive.gz --nsInclude 'shop.orders' \
+          -u "$BACKUP_USER" -p "$BACKUP_PASSWORD" --authenticationDatabase admin 2>&1 | tail -1
+      args:
+        executable: /bin/bash
+      register: restored
+      changed_when: true   # каждый запуск -- новое действие
+      tags: restore
+
+    - name: "restore: state after restore"
+      ansible.builtin.command: *orders_state
+      register: after
+      changed_when: false
+      failed_when: after.stdout != before.stdout
+      tags: restore
+
+    - name: "restore: result"
+      ansible.builtin.debug:
+        msg:
+          - "before:  {{ before.stdout }}"
+          - "backup:  {{ copy.stdout }}"
+          - "dropped: {{ dropped.stdout }}"
+          - "mongorestore: {{ restored.stdout | regex_replace('^\\S+\\s+', '') }}"
+          - "after:   {{ after.stdout }}"
+      tags: restore
+
+    # --- schedule -----------------------------------------------------------
+    - name: "schedule: package cron"
+      ansible.builtin.apt:
+        name: cron
+        state: present
+      tags: schedule
+
+    - name: "schedule: service cron enabled and running"
+      ansible.builtin.systemd_service:
+        name: cron
+        enabled: true
+        state: started
+      tags: schedule
+
+    # Вывод уходит в syslog (journalctl -t mongo-backup), а не на почту root.
+    - name: "schedule: cron job backup of {{ lab_dbs | join(', ') }}"
+      ansible.builtin.cron:
+        name: mongo-backup
+        minute: "{{ backup_cron.minute }}"
+        hour: "{{ backup_cron.hour }}"
+        job: /usr/local/bin/mongo-backup cron {{ lab_dbs | join(' ') }} 2>&1 | logger -t mongo-backup
+      tags: schedule
+
+    - name: "schedule: cron job removes copies older than {{ backup_keep_days }} days"
+      ansible.builtin.cron:
+        name: mongo-backup-cleanup
+        minute: "{{ backup_cron.minute }}"
+        hour: "{{ backup_cron.hour }}"
+        job: >-
+          find {{ backup_dir }} -mindepth 1 -maxdepth 1 -type d -mtime +{{ backup_keep_days }}
+          -print -exec rm -rf {} + 2>&1 | logger -t mongo-backup
+      tags: schedule
+
+    # Запускаю строку из crontab так, как её запустит cron: sh, пустое окружение,
+    # PATH по умолчанию. Так видно, что задание работает, не дожидаясь 03:00.
+    - name: "schedule: run the cron job once with the cron environment"
+      # Вывод задания уходит в logger, код возврата mongo-backup теряется,
+      # поэтому проверяю, что появилась новая папка cron-*.
+      ansible.builtin.shell: |
+        set -euo pipefail
+        line=$(crontab -l | grep -A1 '^#Ansible: mongo-backup$' | tail -1)
+        echo "crontab: $line"
+        old=$(ls -1d {{ backup_dir }}/cron-* 2>/dev/null | tail -1 || true)
+        sleep 1
+        env -i PATH=/usr/bin:/bin sh -c "$(echo "$line" | cut -d' ' -f6-)"
+        last=$(ls -1d {{ backup_dir }}/cron-* | tail -1)
+        [ "$last" != "$old" ]
+        ls -l "$last" | tail -n +2 | awk -v d="$last" '{print d "/" $NF ": " $5 " bytes"}'
+      args:
+        executable: /bin/bash
+      register: out
+      changed_when: true   # каждый запуск -- новая копия
+      failed_when: out.rc != 0 or (out.stdout_lines | length) != (lab_dbs | length) + 1
+      tags: schedule
+
+    - name: "schedule: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: schedule
+
+    # --- restore-date -------------------------------------------------------
+    # Без -e restore_date шаг сам готовит пример: свежая копия, потом в первую
+    # коллекцию базы добавляется документ-метка. Восстановление на now() должно
+    # вернуть базу к копии: метки нет, dbHash такой же, как в момент копии.
+    - name: "restore-date: example, fresh backup of {{ backup_db }}"
+      ansible.builtin.shell: sleep 1 && mongo-backup {{ backup_db }} {{ backup_db }}
+      register: copy
+      changed_when: true   # каждый запуск -- новая копия
+      when: restore_date is not defined
+      tags: restore-date
+
+    - name: "restore-date: example, dbHash at backup and marker after it"
+      ansible.builtin.command:
+        argv:
+          - mongo-admin
+          - "{{ backup_db }}"
+          - |
+            print(db.runCommand({ dbHash: 1 }).md5);
+            const c = db.getCollectionNames().sort()[0];
+            db[c].insertOne({ restoreMarker: new Date() });
+            print(c);
+      register: at_backup
+      changed_when: true   # пишет документ-метку
+      when: restore_date is not defined
+      tags: restore-date
+
+    # Метки времени копий в UTC, поэтому now(utc=true).
+    - name: "restore-date: pick copy of {{ backup_db }}"
+      ansible.builtin.shell: |
+        set -euo pipefail
+        want=$(printf '%s' "$WANT" | tr -d ':-' | tr ' ' T)
+        case $want in ????????) want="${want}T" ;; esac
+        want=$(printf '%-15.15s' "$want" | tr ' ' 0)
+        echo "$want"
+        for d in {{ backup_dir }}/*-*; do
+          if [ -f "$d/{{ backup_db }}.archive.gz" ]; then echo "${d##*-} $d"; fi
+        done | sort | awk -v w="$want" '$1 <= w { p = $2 } END { print p }'
+      args:
+        executable: /bin/bash
+      environment:
+        WANT: "{{ restore_date | default(now(utc=true, fmt='%Y%m%dT%H%M%S')) }}"
+      register: pick
+      changed_when: false
+      failed_when: pick.rc != 0 or pick.stdout_lines[1] | default('') == ''
+      tags: restore-date
+
+    - name: "restore-date: state of {{ backup_db }} before"
+      ansible.builtin.command: &db_state
+        argv:
+          - mongo-admin
+          - "{{ backup_db }}"
+          - |
+            const names = db.getCollectionNames().sort();
+            print(db.runCommand({ dbHash: 1 }).md5);
+            print(names.map(c => `${c}: ${db[c].estimatedDocumentCount()}`).join(', '));
+      register: before
+      changed_when: false
+      tags: restore-date
+
+    # --drop удаляет каждую коллекцию из архива перед загрузкой. Коллекции,
+    # которых в копии нет, mongorestore не трогает.
+    - name: "restore-date: mongorestore --drop {{ backup_db }}"
+      ansible.builtin.shell: |
+        set -o pipefail
+        . /etc/mongo-backup.env
+        mongorestore --drop --gzip --archive={{ pick.stdout_lines[1] }}/{{ backup_db }}.archive.gz \
+          --nsInclude '{{ backup_db }}.*' \
+          -u "$BACKUP_USER" -p "$BACKUP_PASSWORD" --authenticationDatabase admin 2>&1 | tail -1
+      args:
+        executable: /bin/bash
+      register: restored
+      changed_when: true   # каждый запуск -- новое действие
+      tags: restore-date
+
+    - name: "restore-date: state of {{ backup_db }} after"
+      ansible.builtin.command: *db_state
+      register: after
+      changed_when: false
+      failed_when: >-
+        restore_date is not defined and
+        (after.stdout_lines[0] != at_backup.stdout_lines[0] or pick.stdout_lines[1] != copy.stdout)
+      tags: restore-date
+
+    - name: "restore-date: result"
+      ansible.builtin.debug:
+        msg:
+          - "date:    {{ pick.stdout_lines[0] }} (UTC)"
+          - "copy:    {{ pick.stdout_lines[1] }}"
+          - "before:  md5 {{ before.stdout_lines[0] }}, {{ before.stdout_lines[1] }}"
+          - "mongorestore: {{ restored.stdout | regex_replace('^\\S+\\s+', '') }}"
+          - "after:   md5 {{ after.stdout_lines[0] }}, {{ after.stdout_lines[1] }}"
+          - "{{ ('md5 at backup: ' ~ at_backup.stdout_lines[0] ~ ', marker was in ' ~ at_backup.stdout_lines[1])
+               if restore_date is not defined else '' }}"
+      tags: restore-date

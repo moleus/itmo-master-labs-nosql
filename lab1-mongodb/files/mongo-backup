@@ -1,0 +1,19 @@
+#!/bin/sh
+# mongo-backup NAME DB [DB...] — снять mongodump с каждой базы в новую папку
+#   /var/backups/mongodb/NAME-<YYYYmmddTHHMMSS>/<DB>.archive.gz
+# Метка времени в UTC: по ней шаг restore-date выбирает копию на дату.
+# Папка с меткой времени создаётся без -p: если она уже есть, скрипт падает,
+# поэтому новая копия никогда не перезаписывает старую.
+set -eu
+# shellcheck source=/dev/null  # файл создаёт Ansible на ВМ
+. /etc/mongo-backup.env
+name=$1
+shift
+dir="$BACKUP_DIR/$name-$(date -u +%Y%m%dT%H%M%S)"
+mkdir "$dir"
+for db in "$@"; do
+  mongodump --quiet --host 127.0.0.1 --port 27017 \
+    -u "$BACKUP_USER" -p "$BACKUP_PASSWORD" --authenticationDatabase admin \
+    --db "$db" --gzip --archive="$dir/$db.archive.gz"
+done
+echo "$dir"

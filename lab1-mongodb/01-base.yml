@@ -1,0 +1,398 @@
+# Часть 1. Базовая настройка MongoDB на ВМ (без Docker).
+#
+# Весь сценарий:      ansible-playbook 01-base.yml
+# Один шаг:           ansible-playbook 01-base.yml -t restart
+# Список шагов:       ansible-playbook 01-base.yml --list-tags
+#
+# Шаги (теги) по пунктам задания:
+#   prepare    подготовить хост: пакеты, sysctl, THP, репозиторий MongoDB
+#   install    поставить MongoDB, включить авторизацию, создать admin
+#   autostart  включить автозапуск mongod
+#   reboot     перезагрузить ВМ и проверить, что mongod поднялся сам
+#   stop       остановить сервер
+#   start      запустить сервер
+#   restart    перезапустить сервер
+#   health     проверить доступность сервера и вывести отчёт
+#   seed       создать учебные базы shop и school
+
+- name: "Part 1: base setup"
+  hosts: mongo
+  gather_facts: true
+
+  tasks:
+    # --- prepare ----------------------------------------------------------
+    - name: "prepare: install base packages"
+      ansible.builtin.apt:
+        name: [gnupg, curl, ca-certificates, tar, python3-debian]   # python3-debian нужен модулю deb822_repository
+        update_cache: true
+        cache_valid_time: 3600
+      tags: prepare
+
+    - name: "prepare: kernel settings for mongod"
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/90-mongodb.conf
+        mode: "0644"
+        content: |
+          # Рекомендации MongoDB production notes
+          vm.swappiness = 1
+          vm.max_map_count = 262144
+          net.ipv4.tcp_keepalive_time = 120
+      tags: prepare
+
+    - name: "prepare: apply kernel settings"
+      ansible.builtin.command: sysctl --system
+      changed_when: false   # повторное применение тех же значений ничего не меняет
+      tags: prepare
+
+    - name: "prepare: THP settings unit"
+      ansible.builtin.copy:
+        src: files/mongo-thp.service
+        dest: /etc/systemd/system/mongo-thp.service
+        mode: "0644"
+      tags: prepare
+
+    - name: "prepare: enable THP settings unit"
+      ansible.builtin.systemd_service:
+        name: mongo-thp
+        enabled: true
+        state: started
+        daemon_reload: true
+      tags: prepare
+
+    - name: "prepare: MongoDB repository key"
+      ansible.builtin.get_url:
+        url: "{{ mongo_repo_key }}"
+        dest: /etc/apt/keyrings/mongodb-server.asc
+        mode: "0644"
+        timeout: 60
+      register: key
+      until: key is succeeded   # ключ скачивается по сети
+      retries: 5
+      delay: 10
+      tags: prepare
+
+    - name: "prepare: add MongoDB {{ mongo_series }} apt repository"
+      ansible.builtin.deb822_repository:
+        # Имя без точки: разные версии ansible-core по-разному чистят точки в имени файла.
+        name: mongodb-org
+        types: deb
+        uris: https://repo.mongodb.org/apt/ubuntu
+        suites: "{{ ansible_distribution_release }}/mongodb-org/{{ mongo_series }}"
+        components: multiverse
+        signed_by: /etc/apt/keyrings/mongodb-server.asc
+      tags: prepare
+
+    - name: "prepare: refresh apt cache"
+      ansible.builtin.apt:
+        update_cache: true
+      changed_when: false   # обновление списка пакетов, система не меняется
+      tags: prepare
+
+    - name: "prepare: check host"
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "os: $(. /etc/os-release; echo $PRETTY_NAME), $(uname -m), $(nproc) cpu, $(free -m | awk '/Mem/{print $2}') MB"
+        echo "swappiness: $(sysctl -n vm.swappiness), max_map_count: $(sysctl -n vm.max_map_count)"
+        echo "THP enabled: $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
+        echo "THP defrag: $(cat /sys/kernel/mm/transparent_hugepage/defrag)"
+        echo "mongodb-org candidate: $(apt-cache policy mongodb-org | awk '/Candidate/{print $2}')"
+      args:
+        executable: /bin/bash
+      register: out
+      changed_when: false
+      failed_when: "'(none)' in out.stdout"
+      tags: prepare
+
+    - name: "prepare: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: prepare
+
+    # --- install ----------------------------------------------------------
+    - name: "install: mongodb-org packages"
+      ansible.builtin.apt:
+        name: mongodb-org
+        state: present
+      tags: install
+
+    - name: "install: mongod.conf with authorization enabled"
+      ansible.builtin.template:
+        src: templates/mongod.conf.j2
+        dest: /etc/mongod.conf
+        mode: "0644"
+      register: mongod_conf
+      tags: install
+
+    - name: "install: directories"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: [/opt/mongo-lab]
+      tags: install
+
+    - name: "install: helper scripts and credentials"
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dest }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { src: files/mongo-admin, dest: /usr/local/bin/mongo-admin, mode: "0755" }
+        - { src: files/mongo-try, dest: /usr/local/bin/mongo-try, mode: "0755" }
+        - { src: files/mongo-health, dest: /usr/local/bin/mongo-health, mode: "0755" }
+      loop_control:
+        label: "{{ item.dest }}"
+      tags: install
+
+    - name: "install: admin credentials file"
+      ansible.builtin.template:
+        src: templates/mongo-admin.env.j2
+        dest: /etc/mongo-admin.env
+        mode: "0600"
+      tags: install
+
+    - name: "install: start mongod"
+      ansible.builtin.systemd_service:
+        name: mongod
+        state: "{{ 'restarted' if mongod_conf.changed else 'started' }}"
+        daemon_reload: true
+      tags: install
+
+    - name: "install: wait for port {{ mongo_port }}"
+      ansible.builtin.wait_for:
+        port: "{{ mongo_port }}"
+        timeout: 60
+      tags: install
+
+    # Авторизация включена сразу. Первого пользователя можно создать только
+    # с localhost, пока в базе нет ни одного пользователя (localhost exception).
+    - name: "install: create admin user"
+      ansible.builtin.shell: |
+        if mongo-admin admin 'db.runCommand({connectionStatus: 1}).ok' >/dev/null 2>&1; then
+          echo "admin: exists"
+        else
+          mongosh --quiet mongodb://127.0.0.1:{{ mongo_port }}/admin --eval '
+            db.createUser({user: "{{ mongo_admin_user }}", pwd: "{{ mongo_admin_password }}",
+                           roles: ["root"]})' >/dev/null && echo "admin: created"
+        fi
+      register: out
+      changed_when: "'created' in out.stdout"
+      tags: install
+
+    - name: "install: check version, auth and startup warnings"
+      ansible.builtin.shell: |
+        set -o pipefail
+        mongo-admin admin '
+          print("version: " + db.version());
+          const w = db.adminCommand({getLog: "startupWarnings"}).log
+            .map(l => JSON.parse(l).attr?.message || JSON.parse(l).msg);
+          print("startup warnings: " + (w.length ? w.join("; ") : "none"));
+          print("tcmalloc per-CPU caches: " + db.serverStatus({tcmalloc: 1}).tcmalloc.usingPerCPUCaches);'
+        echo -n "anonymous listDatabases: "
+        mongosh --quiet mongodb://127.0.0.1:{{ mongo_port }}/admin \
+          --eval 'try { db.adminCommand({listDatabases: 1}); print("ALLOWED") } catch (e) { print("DENIED " + e.codeName) }'
+      args:
+        executable: /bin/bash
+      register: out
+      changed_when: false
+      failed_when: "'DENIED Unauthorized' not in out.stdout or 'per-CPU caches: true' not in out.stdout"
+      tags: install
+
+    - name: "install: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: install
+
+    # --- autostart --------------------------------------------------------
+    - name: "autostart: state before"
+      ansible.builtin.command: systemctl is-enabled mongod  # noqa: command-instead-of-module  нужен вывод как есть
+      register: before
+      changed_when: false
+      failed_when: false
+      tags: autostart
+
+    - name: "autostart: enable mongod at boot"
+      ansible.builtin.systemd_service:
+        name: mongod
+        enabled: true
+      tags: autostart
+
+    - name: "autostart: check"
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "is-enabled before: {{ before.stdout }}"
+        echo "is-enabled after: $(systemctl is-enabled mongod)"
+        echo "link: $(ls /etc/systemd/system/multi-user.target.wants/ | grep mongod)"
+      args:
+        executable: /bin/bash
+      register: out
+      changed_when: false
+      failed_when: "'after: enabled' not in out.stdout"
+      tags: autostart
+
+    - name: "autostart: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: autostart
+
+    # --- reboot -----------------------------------------------------------
+    - name: "reboot: reboot VM"
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+        boot_time_command: "{{ reboot_boot_time_command | default('cat /proc/sys/kernel/random/boot_id') }}"
+      tags: reboot
+
+    - name: "reboot: wait for mongod"
+      ansible.builtin.wait_for:
+        port: "{{ mongo_port }}"
+        timeout: 60
+      tags: reboot
+
+    - name: "reboot: check mongod started by itself"
+      ansible.builtin.shell: |
+        echo "system boot: $(uptime -s)"
+        echo "mongod: $(systemctl is-active mongod), started $(systemctl show mongod -p ActiveEnterTimestamp --value)"
+        mongo-admin admin 'print("mongod uptime: " + db.serverStatus().uptime + " s")'
+      register: out
+      changed_when: false
+      failed_when: "'mongod: active' not in out.stdout"
+      tags: reboot
+
+    - name: "reboot: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: reboot
+
+    # --- stop / start / restart ------------------------------------------
+    - name: "stop: stop mongod"
+      ansible.builtin.systemd_service:
+        name: mongod
+        state: stopped
+      tags: stop
+
+    - name: "stop: check"
+      ansible.builtin.shell: |
+        set -o pipefail
+        echo "mongod: $(systemctl is-active mongod)"
+        timeout 2 bash -c '</dev/tcp/127.0.0.1/{{ mongo_port }}' 2>/dev/null \
+          && echo "port {{ mongo_port }}: open" || echo "port {{ mongo_port }}: closed"
+      args:
+        executable: /bin/bash
+      register: out
+      changed_when: false
+      failed_when: "'closed' not in out.stdout"
+      tags: stop
+
+    - name: "stop: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: stop
+
+    - name: "start: start mongod"
+      ansible.builtin.systemd_service:
+        name: mongod
+        state: started
+      tags: start
+
+    - name: "start: wait for port {{ mongo_port }}"
+      ansible.builtin.wait_for:
+        port: "{{ mongo_port }}"
+        timeout: 60
+      tags: start
+
+    - name: "start: check"
+      ansible.builtin.shell: |
+        echo "mongod: $(systemctl is-active mongod), pid $(systemctl show mongod -p MainPID --value)"
+        mongo-admin admin 'print("ping: " + db.adminCommand({ping: 1}).ok + ", uptime " + db.serverStatus().uptime + " s")'
+      register: out
+      changed_when: false
+      failed_when: "'ping: 1' not in out.stdout"
+      tags: start
+
+    - name: "start: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: start
+
+    - name: "restart: pid before"
+      ansible.builtin.command: systemctl show mongod -p MainPID --value  # noqa: command-instead-of-module  модуль не отдаёт PID
+      register: pid_before
+      changed_when: false
+      tags: restart
+
+    - name: "restart: restart mongod"
+      ansible.builtin.systemd_service:
+        name: mongod
+        state: restarted
+      tags: restart
+
+    - name: "restart: wait for port {{ mongo_port }}"
+      ansible.builtin.wait_for:
+        port: "{{ mongo_port }}"
+        timeout: 60
+      tags: restart
+
+    - name: "restart: check"
+      ansible.builtin.shell: |
+        echo "pid before: {{ pid_before.stdout }}"
+        echo "pid after: $(systemctl show mongod -p MainPID --value)"
+        mongo-admin admin 'print("uptime after restart: " + db.serverStatus().uptime + " s")'
+      register: out
+      changed_when: false
+      failed_when: out.stdout_lines[0].split(':')[1] == out.stdout_lines[1].split(':')[1]
+      tags: restart
+
+    - name: "restart: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines }}"
+      tags: restart
+
+    # --- health -----------------------------------------------------------
+    - name: "health: check on VM (mongo-health)"
+      ansible.builtin.command: mongo-health
+      register: out
+      changed_when: false
+      failed_when: false
+      tags: health
+
+    - name: "health: check port from control host"
+      ansible.builtin.wait_for:
+        host: "{{ mongo_bind_ip }}"
+        port: "{{ mongo_port }}"
+        timeout: 3
+      delegate_to: localhost
+      become: false
+      register: net
+      failed_when: false
+      tags: health
+
+    - name: "health: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines + ['from control host ' ~ mongo_bind_ip ~ ':' ~ mongo_port ~ ': ' ~ ('closed' if net.msg is defined else 'open')] }}"
+      tags: health
+
+    - name: "health: fail if server is not available"
+      ansible.builtin.assert:
+        that: out.rc == 0 and net.msg is not defined
+        fail_msg: "MongoDB is NOT available"
+        success_msg: "MongoDB is available"
+      tags: health
+
+    # --- seed -------------------------------------------------------------
+    - name: "seed: copy seed.js"
+      ansible.builtin.copy:
+        src: files/seed.js
+        dest: /opt/mongo-lab/
+        mode: "0644"
+      tags: seed
+
+    - name: "seed: create training databases"
+      ansible.builtin.command: mongo-admin admin "load('/opt/mongo-lab/seed.js')"
+      register: out
+      changed_when: "'created' in out.stdout"
+      tags: seed
+
+    - name: "seed: result"
+      ansible.builtin.debug:
+        msg: "{{ out.stdout_lines | reject('equalto', 'true') }}"
+      tags: seed

@@ -1,0 +1,11 @@
+profile: production
+exclude_paths:
+  - .vagrant/
+  - .github/
+skip_list:
+  # Имена задач начинаются с тега в нижнем регистре ("restart: check"),
+  # чтобы тег из вывода можно было сразу скопировать в -t.
+  - name[casing]
+  # По той же причине в tasks/check-access.yml имя начинается с шаблона {{ step }}:
+  # это тег шага, он должен стоять первым.
+  - name[template]

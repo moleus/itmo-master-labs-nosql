@@ -1,0 +1,68 @@
+# ЛР-1: линтеры и интеграционный прогон плейбуков на чистой Ubuntu 24.04.
+name: lab1-mongodb
+
+on:
+  # push только в main: для ветки с PR хватает запуска от pull_request.
+  push:
+    branches: [main]
+    paths: ["lab1-mongodb/**", ".github/lab1-mongodb/**", ".github/workflows/lab1-mongodb.yml"]
+  pull_request:
+    paths: ["lab1-mongodb/**", ".github/lab1-mongodb/**", ".github/workflows/lab1-mongodb.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: lab1-mongodb
+
+env:
+  ACTIONLINT_VERSION: "1.7.12"
+  SHFMT_VERSION: "3.14.1"
+  DASHBOARD_LINTER_VERSION: "0.3.0"
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install linters
+        # Готовые бинарники из релизов, без сборки из исходников. shellcheck уже есть на runner'е.
+        run: |
+          bin="$HOME/.local/bin" && mkdir -p "$bin" && echo "$bin" >> "$GITHUB_PATH"
+          gh="https://github.com"
+          curl -fsSL "$gh/rhysd/actionlint/releases/download/v$ACTIONLINT_VERSION/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" |
+            tar -xz -C "$bin" actionlint
+          curl -fsSL -o "$bin/shfmt" "$gh/mvdan/sh/releases/download/v$SHFMT_VERSION/shfmt_v${SHFMT_VERSION}_linux_amd64"
+          chmod +x "$bin/shfmt"
+          curl -fsSL "$gh/grafana/dashboard-linter/releases/download/v$DASHBOARD_LINTER_VERSION/dashboard-linter_${DASHBOARD_LINTER_VERSION}_linux_amd64.tar.gz" |
+            tar -xz -C "$bin" dashboard-linter
+          pipx install ansible-lint
+          pipx install yamllint
+          pipx install ruff
+      - name: actionlint
+        run: actionlint ../.github/workflows/*.yml
+      - name: make lint
+        run: make lint
+
+  integration:
+    needs: lint
+    # Только amd64: на arm64 сценарий проверяется на ВМ (Apple Silicon).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Ansible
+        run: pipx install ansible-core
+      - name: Playbooks and checks
+        run: ../.github/lab1-mongodb/integration.sh
+      - name: Service logs on failure
+        if: failure()
+        run: |
+          sudo systemctl --no-pager status mongod mongodb_exporter victoriametrics grafana-server || true
+          sudo tail -n 50 /var/log/mongodb/mongod.log || true

@@ -1,0 +1,28 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# ЛР-1 НБД. ВМ для MongoDB, без Docker.
+# Провайдер: VMware Fusion на Apple Silicon (arm64), как в прошлых лабах.
+# Box: bento/ubuntu-24.04. Для Debian 12 у MongoDB нет arm64-пакетов,
+# для Ubuntu 24.04 (noble) arm64 есть.
+#
+#   vagrant up
+#   ansible-playbook 01-base.yml           # и дальше по частям, см. README.md
+
+Vagrant.configure("2") do |config|
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+  config.vm.boot_timeout = 600
+
+  config.vm.define "mongo" do |vm|
+    vm.vm.box = "bento/ubuntu-24.04"
+    vm.vm.hostname = "soloviev-mongo"
+    # Статический IP: с DHCP на приватной сети ломался resolv.conf (см. linux-systems/lab8).
+    vm.vm.network "private_network", ip: "192.168.176.110"
+
+    vm.vm.provider "vmware_desktop" do |v|
+      v.memory = "2048"
+      v.cpus   = 2
+      v.gui    = false
+    end
+  end
+end
