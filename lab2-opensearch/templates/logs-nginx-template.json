@@ -1,0 +1,37 @@
+{
+  "index_patterns": [
+    "logs-nginx"
+  ],
+  "data_stream": {},
+  "composed_of": [
+    "logs-nginx-settings"
+  ],
+  "priority": 200,
+  "template": {
+    "mappings": {
+      "properties": {
+        "@timestamp": {
+          "type": "date"
+        },
+        "remote_addr": {
+          "type": "ip"
+        },
+        "request": {
+          "type": "keyword"
+        },
+        "status": {
+          "type": "short"
+        },
+        "bytes_sent": {
+          "type": "long"
+        },
+        "http_user_agent": {
+          "type": "keyword"
+        },
+        "message": {
+          "type": "text"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  # The plugin answers on every node. Each node reports its own node metrics.
+  - job_name: opensearch
+    metrics_path: /_prometheus/metrics
+    scheme: https
+    basic_auth:
+      username: monitor
+      password_file: /tmp/monitor-password
+    tls_config:
+      ca_file: /certs/root-ca.pem
+    static_configs:
+      - targets: [hot1:9200, hot2:9200, warm1:9200]

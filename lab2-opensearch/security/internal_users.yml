@@ -1,0 +1,20 @@
+# Passwords are in .env.example. Make a new hash with
+# docker compose exec hot1 plugins/opensearch-security/tools/hash.sh -p PASSWORD
+_meta:
+  type: "internalusers"
+  config_version: 2
+admin:
+  hash: "$2y$12$qhc3Jggr5XbtwMic3zucGOsoNZk6yIeS.73sXQLIXrxJ.rNVBDgGK"
+  reserved: true
+  backend_roles: [admin]
+  description: "Cluster administrator"
+kibanaserver:
+  hash: "$2y$12$Zgs8u0Uoz/6Nhl8e8gEeXurYD0KqXtWCy6L1yBc0zp6kX44tZSMWa"
+  reserved: true
+  description: "OpenSearch Dashboards server"
+reader:
+  hash: "$2y$12$IoJjxU0qlfdY.FSfpbNFfuZN6Q809SSsLpHKI0rxFnRbBcI0135ty"
+  description: "Reads nginx logs in Dashboards"
+monitor:
+  hash: "$2y$12$itRNyw.7N86Fjx824WOTpOj4iTnqIUUyx8RutVaWdPvv4EJ8G3hoS"
+  description: "Reads cluster and node metrics for Prometheus"
