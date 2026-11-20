@@ -1,0 +1,184 @@
+name: lab2
+
+x-node: &node
+  # The image is the stock one plus the Prometheus exporter plugin.
+  build:
+    context: ./opensearch
+    args:
+      OPENSEARCH_VERSION: ${OPENSEARCH_VERSION:-3.9.0}
+  image: lab2-opensearch:${OPENSEARCH_VERSION:-3.9.0}
+  depends_on:
+    certs:
+      condition: service_completed_successfully
+  ulimits:
+    memlock: { soft: -1, hard: -1 }
+    nofile: { soft: 65536, hard: 65536 }
+  restart: unless-stopped
+
+x-node-env: &node-env
+  DISABLE_INSTALL_DEMO_CONFIG: "true"
+  OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
+  node.roles: cluster_manager,data
+
+services:
+  certs:
+    image: alpine:3.22
+    command: sh -c 'apk add --no-cache openssl >/dev/null && /gen-certs.sh'
+    environment:
+      OUT: /out
+    volumes:
+      - ./certs/gen-certs.sh:/gen-certs.sh:ro
+      - ./certs/out:/out
+
+  hot1:
+    <<: *node
+    environment:
+      <<: *node-env
+      node.name: hot1
+      # Peers connect by this name. The node certificate has it in SAN.
+      network.publish_host: hot1
+      node.attr.temp: hot
+    volumes:
+      - ./config/opensearch.yml:/usr/share/opensearch/config/opensearch.yml:ro
+      - ./security:/usr/share/opensearch/config/opensearch-security:ro
+      - ./certs/out/root-ca.pem:/usr/share/opensearch/config/certs/root-ca.pem:ro
+      - ./certs/out/hot1.pem:/usr/share/opensearch/config/certs/node.pem:ro
+      - ./certs/out/hot1-key.pem:/usr/share/opensearch/config/certs/node-key.pem:ro
+      - hot1-data:/usr/share/opensearch/data
+    ports:
+      - 127.0.0.1:9200:9200
+
+  hot2:
+    <<: *node
+    environment:
+      <<: *node-env
+      node.name: hot2
+      network.publish_host: hot2
+      node.attr.temp: hot
+    volumes:
+      - ./config/opensearch.yml:/usr/share/opensearch/config/opensearch.yml:ro
+      - ./security:/usr/share/opensearch/config/opensearch-security:ro
+      - ./certs/out/root-ca.pem:/usr/share/opensearch/config/certs/root-ca.pem:ro
+      - ./certs/out/hot2.pem:/usr/share/opensearch/config/certs/node.pem:ro
+      - ./certs/out/hot2-key.pem:/usr/share/opensearch/config/certs/node-key.pem:ro
+      - hot2-data:/usr/share/opensearch/data
+
+  warm1:
+    <<: *node
+    environment:
+      <<: *node-env
+      node.name: warm1
+      network.publish_host: warm1
+      node.attr.temp: warm
+    volumes:
+      - ./config/opensearch.yml:/usr/share/opensearch/config/opensearch.yml:ro
+      - ./security:/usr/share/opensearch/config/opensearch-security:ro
+      - ./certs/out/root-ca.pem:/usr/share/opensearch/config/certs/root-ca.pem:ro
+      - ./certs/out/warm1.pem:/usr/share/opensearch/config/certs/node.pem:ro
+      - ./certs/out/warm1-key.pem:/usr/share/opensearch/config/certs/node-key.pem:ro
+      - warm1-data:/usr/share/opensearch/data
+
+  # One-shot. It applies the templates and the ISM policy over https.
+  # It is safe to run again.
+  setup:
+    image: curlimages/curl:8.11.1
+    depends_on: [hot1]
+    entrypoint: [sh, /lab/setup/setup.sh]
+    environment:
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set it in .env}
+    volumes:
+      - ./setup:/lab/setup:ro
+      - ./templates:/lab/templates:ro
+      - ./ism:/lab/ism:ro
+      - ./certs/out/root-ca.pem:/certs/root-ca.pem:ro
+    restart: "no"
+
+  dashboards:
+    image: opensearchproject/opensearch-dashboards:${OPENSEARCH_VERSION:-3.9.0}
+    depends_on: [hot1, hot2]
+    environment:
+      KIBANASERVER_PASSWORD: ${KIBANASERVER_PASSWORD:?set it in .env}
+    volumes:
+      - ./config/opensearch_dashboards.yml:/usr/share/opensearch-dashboards/config/opensearch_dashboards.yml:ro
+      - ./certs/out/root-ca.pem:/usr/share/opensearch-dashboards/config/certs/root-ca.pem:ro
+    ports:
+      - 127.0.0.1:5601:5601
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:1.28.0-alpine
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/html:/usr/share/nginx/html:ro
+      - nginx-logs:/var/log/nginx
+    ports:
+      - 127.0.0.1:8080:80
+    restart: unless-stopped
+
+  # Reads the nginx log from the shared volume. The key file belongs to uid 1000.
+  bento:
+    image: ghcr.io/warpstreamlabs/bento:1.22.0
+    user: "1000:1000"
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      nginx:
+        condition: service_started
+    volumes:
+      - ./bento/bento.yaml:/bento.yaml:ro
+      - nginx-logs:/var/log/nginx:ro
+      - ./certs/out/root-ca.pem:/certs/root-ca.pem:ro
+      - ./certs/out/bento.pem:/certs/bento.pem:ro
+      - ./certs/out/bento-key.pem:/certs/bento-key.pem:ro
+    restart: unless-stopped
+
+  # Sends requests to nginx. More load: BATCH=200 docker compose up -d loadgen
+  loadgen:
+    image: curlimages/curl:8.11.1
+    depends_on: [nginx]
+    entrypoint: [sh, /loadgen.sh]
+    environment:
+      BATCH: ${BATCH:-5}
+      PAUSE: ${PAUSE:-1}
+    volumes:
+      - ./loadgen/loadgen.sh:/loadgen.sh:ro
+    restart: unless-stopped
+
+  # Scrapes /_prometheus/metrics of every node as user monitor.
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    depends_on: [hot1, hot2, warm1]
+    entrypoint: [sh, -c]
+    # The password file is made from the environment, so no password is in git.
+    command:
+      - printf %s "$$MONITOR_PASSWORD" > /tmp/monitor-password && exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus --storage.tsdb.retention.time=1d
+    environment:
+      MONITOR_PASSWORD: ${MONITOR_PASSWORD:?set it in .env}
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./certs/out/root-ca.pem:/certs/root-ca.pem:ro
+      - prometheus-data:/prometheus
+    ports:
+      - 127.0.0.1:9090:9090
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.5
+    depends_on: [prometheus]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:?set it in .env}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - 127.0.0.1:3000:3000
+    restart: unless-stopped
+
+volumes:
+  hot1-data:
+  hot2-data:
+  warm1-data:
+  nginx-logs:
+  prometheus-data:
+  grafana-data:

@@ -1,0 +1,70 @@
+{
+  "policy": {
+    "description": "logs-nginx: rollover on hot, move to warm, delete 10 minutes after creation",
+    "default_state": "hot",
+    "states": [
+      {
+        "name": "hot",
+        "actions": [
+          {
+            "rollover": {
+              "min_index_age": "1m",
+              "min_size": "1mb"
+            }
+          }
+        ],
+        "transitions": [
+          {
+            "state_name": "warm",
+            "conditions": {
+              "min_rollover_age": "1m"
+            }
+          }
+        ]
+      },
+      {
+        "name": "warm",
+        "actions": [
+          {
+            "replica_count": {
+              "number_of_replicas": 0
+            }
+          },
+          {
+            "allocation": {
+              "require": {
+                "temp": "warm"
+              },
+              "wait_for": true
+            }
+          }
+        ],
+        "transitions": [
+          {
+            "state_name": "delete",
+            "conditions": {
+              "min_index_age": "10m"
+            }
+          }
+        ]
+      },
+      {
+        "name": "delete",
+        "actions": [
+          {
+            "delete": {}
+          }
+        ],
+        "transitions": []
+      }
+    ],
+    "ism_template": [
+      {
+        "index_patterns": [
+          "logs-nginx*"
+        ],
+        "priority": 100
+      }
+    ]
+  }
+}

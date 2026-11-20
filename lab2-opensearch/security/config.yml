@@ -1,0 +1,30 @@
+_meta:
+  type: "config"
+  config_version: 2
+config:
+  dynamic:
+    http:
+      anonymous_auth_enabled: false
+    authc:
+      # Bento: TLS client certificate, user name is the CN.
+      clientcert_auth_domain:
+        http_enabled: true
+        transport_enabled: false
+        order: 0
+        http_authenticator:
+          type: clientcert
+          config:
+            username_attribute: cn
+          challenge: false
+        authentication_backend:
+          type: noop
+      # People and Dashboards: HTTP Basic against internal_users.yml.
+      basic_internal_auth_domain:
+        http_enabled: true
+        transport_enabled: true
+        order: 1
+        http_authenticator:
+          type: basic
+          challenge: true
+        authentication_backend:
+          type: intern

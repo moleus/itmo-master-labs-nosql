@@ -1,0 +1,24 @@
+_meta:
+  type: "roles"
+  config_version: 2
+# Bento writes to the logs-nginx data stream. create_index lets the first
+# bulk create the data stream, write lets it add documents.
+logs_writer:
+  cluster_permissions:
+    - indices:data/write/bulk
+  index_permissions:
+    - index_patterns: [logs-nginx*]
+      allowed_actions: [create_index, write]
+logs_reader:
+  cluster_permissions:
+    - cluster_composite_ops_ro
+  index_permissions:
+    - index_patterns: [logs-nginx*]
+      allowed_actions: [read, indices:admin/mappings/get]
+# Prometheus reads cluster, node and index stats. It cannot read documents.
+logs_monitor:
+  cluster_permissions:
+    - cluster_monitor
+  index_permissions:
+    - index_patterns: ["*"]
+      allowed_actions: [indices_monitor]

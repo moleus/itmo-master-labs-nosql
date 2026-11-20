@@ -1,0 +1,8 @@
+server.host: 0.0.0.0
+opensearch.hosts: [https://hot1:9200, https://hot2:9200]
+opensearch.ssl.verificationMode: full
+opensearch.ssl.certificateAuthorities: [/usr/share/opensearch-dashboards/config/certs/root-ca.pem]
+opensearch.username: kibanaserver
+opensearch.password: ${KIBANASERVER_PASSWORD}
+opensearch.requestHeadersAllowlist: [authorization, securitytenant]
+opensearch_security.multitenancy.enabled: false

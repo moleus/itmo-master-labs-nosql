@@ -1,0 +1,34 @@
+# Shared by all nodes. Node name, roles and the temp attribute come from compose.
+cluster.name: lab2
+network.host: 0.0.0.0
+discovery.seed_hosts: [hot1, hot2, warm1]
+cluster.initial_cluster_manager_nodes: [hot1, hot2, warm1]
+bootstrap.memory_lock: true
+
+plugins.security.ssl.transport.pemcert_filepath: certs/node.pem
+plugins.security.ssl.transport.pemkey_filepath: certs/node-key.pem
+plugins.security.ssl.transport.pemtrustedcas_filepath: certs/root-ca.pem
+plugins.security.ssl.transport.enforce_hostname_verification: true
+
+plugins.security.ssl.http.enabled: true
+plugins.security.ssl.http.pemcert_filepath: certs/node.pem
+plugins.security.ssl.http.pemkey_filepath: certs/node-key.pem
+plugins.security.ssl.http.pemtrustedcas_filepath: certs/root-ca.pem
+# Bento signs in with a client certificate, people sign in with a password.
+plugins.security.ssl.http.clientauth_mode: OPTIONAL
+
+plugins.security.nodes_dn:
+  - CN=hot1,O=nosql-lab
+  - CN=hot2,O=nosql-lab
+  - CN=warm1,O=nosql-lab
+plugins.security.authcz.admin_dn:
+  - CN=admin,O=nosql-lab
+
+# Load security/*.yml into the security index on the first start only.
+# Later changes need securityadmin.sh.
+plugins.security.allow_default_init_securityindex: true
+plugins.security.restapi.roles_enabled: [all_access]
+
+# ISM checks policies every minute, without a random delay. The lab needs fast rollover.
+plugins.index_state_management.job_interval: 1
+plugins.index_state_management.jitter: 0

@@ -1,0 +1,27 @@
+# Read the nginx JSON log and write each line to the logs-nginx data stream.
+# Bento signs in with the client certificate CN=bento (no password).
+# Bento reads the whole file after a restart, so a restart can add duplicate documents.
+input:
+  file_tail:
+    path: /var/log/nginx/access.json
+    start_position: start
+
+output:
+  opensearch:
+    urls: [https://hot1:9200, https://hot2:9200]
+    index: logs-nginx
+    # A data stream accepts only the create action.
+    action: create
+    id: ${!uuid_v4()}
+    tls:
+      enabled: true
+      root_cas_file: /certs/root-ca.pem
+      client_certs:
+        - cert_file: /certs/bento.pem
+          key_file: /certs/bento-key.pem
+    batching:
+      count: 500
+      period: 1s
+
+logger:
+  level: INFO
