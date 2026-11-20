@@ -1,0 +1,15 @@
+apiVersion: 1
+datasources:
+  - name: vm-mon
+    uid: vm-mon
+    type: prometheus
+    access: proxy
+    url: http://vm-mon:8428
+    isDefault: true
+    jsonData: {timeInterval: 5s}
+  - name: vm-main
+    uid: vm-main
+    type: prometheus
+    access: proxy
+    url: http://vm-main:8428
+    jsonData: {timeInterval: 5s}

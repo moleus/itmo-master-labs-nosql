@@ -1,0 +1,209 @@
+# One Bento instance: scrape one web server, limit label cardinality with
+# a shared Redis script, send the text to vm-main.
+#
+#   http_client (1 scrape/s)
+#     -> js: parse text, list distinct (metric, label, value)
+#     -> redis_script: ONE round trip, atomic (script in this file)
+#     -> js: remove rejected labels, sum series that became equal
+#     -> output: vm-main import + a second output that only counts
+#
+# Settings come from env: SCRAPE_URL, INSTANCE, LIMIT, WINDOW_SECONDS.
+http:
+  address: 0.0.0.0:4195
+
+logger:
+  level: INFO
+
+metrics:
+  prometheus: {}
+
+rate_limit_resources:
+  - label: scrape
+    local:
+      count: 1
+      interval: 1s
+
+input:
+  label: scrape_web
+  http_client:
+    url: ${SCRAPE_URL}
+    verb: GET
+    timeout: 3s
+    rate_limit: scrape
+
+pipeline:
+  processors:
+    - label: list_triples
+      javascript:
+        code: |
+          (function () {
+            const SEP = "\u001f";
+            const lineRe = /^([^{ ]+)(?:\{(.*)\})? (\S+)$/;
+            const labelRe = /([A-Za-z_][A-Za-z0-9_]*)="([^"]*)"/g;
+            const text = bento.v0_msg_as_string();
+            const seen = new Set();
+            let n = 0;
+            for (const line of text.split("\n")) {
+              if (line === "" || line[0] === "#") continue;
+              const m = lineRe.exec(line);
+              if (m === null) continue;
+              n++;
+              if (m[2] === undefined) continue;
+              const base = m[1].replace(/_(bucket|sum|count)$/, "");
+              labelRe.lastIndex = 0;
+              let l;
+              while ((l = labelRe.exec(m[2])) !== null) {
+                seen.add(base + SEP + l[1] + SEP + l[2]);
+              }
+            }
+            bento.v0_msg_set_meta("triples", JSON.stringify(Array.from(seen)));
+            bento.v0_msg_set_meta("series_in", String(n));
+          })();
+
+    # One EVALSHA per scrape. The request is the JSON list of triples.
+    - label: limiter
+      branch:
+        request_map: 'root = @triples'
+        processors:
+          - label: limiter_redis
+            redis_script:
+              url: redis://redis:6379
+              retries: 1
+              retry_period: 100ms
+              keys_mapping: 'root = ["limiter:enabled"]'
+              args_mapping: 'root = [ ${LIMIT:100}, ${WINDOW_SECONDS:60}, content().string() ]'
+              script: |
+                -- KEYS[1]  limiter:enabled   ("0" = limiter off, anything else = on)
+                -- ARGV[1]  limit per (metric, label)
+                -- ARGV[2]  window in seconds (TTL of every set)
+                -- ARGV[3]  JSON list of "metric<US>label<US>value"
+                -- Returns a JSON list of the 0-based indexes that were rejected.
+                if redis.call('GET', KEYS[1]) == '0' then
+                  return '[]'
+                end
+                local limit = tonumber(ARGV[1])
+                local window = tonumber(ARGV[2])
+                local triples = cjson.decode(ARGV[3])
+                local rejected = {}
+                for i, t in ipairs(triples) do
+                  local metric, label = string.match(t, '^([^\31]*)\31([^\31]*)\31')
+                  local value = string.sub(t, #metric + #label + 3)
+                  local key = 'lim:' .. metric .. ':' .. label
+                  if redis.call('SISMEMBER', key, value) == 0 then
+                    if redis.call('SCARD', key) < limit then
+                      redis.call('SADD', key, value)
+                      redis.call('EXPIRE', key, window, 'NX')
+                    else
+                      rejected[#rejected + 1] = i - 1
+                    end
+                  end
+                end
+                return '[' .. table.concat(rejected, ',') .. ']'
+        result_map: |
+          meta rejected = content().string()
+          meta limiter_error = "0"
+
+    # Fail open: when Redis does not answer, send every series unchanged.
+    - catch:
+        - mutation: |
+            meta rejected = "[]"
+            meta limiter_error = "1"
+
+    - label: rewrite
+      javascript:
+        code: |
+          (function () {
+            const SEP = "\u001f";
+            const lineRe = /^([^{ ]+)(?:\{(.*)\})? (\S+)$/;
+            const labelRe = /([A-Za-z_][A-Za-z0-9_]*)="([^"]*)"/g;
+            const text = bento.v0_msg_as_string();
+            const triples = JSON.parse(bento.v0_msg_get_meta("triples"));
+            let rej = JSON.parse(bento.v0_msg_get_meta("rejected"));
+            if (typeof rej === "string") rej = JSON.parse(rej);
+            const rejected = new Set(rej.map((i) => triples[i]));
+            const sums = new Map();
+            const removed = new Map();
+            const ts = Date.now();
+            for (const line of text.split("\n")) {
+              if (line === "" || line[0] === "#") continue;
+              const m = lineRe.exec(line);
+              if (m === null) continue;
+              const name = m[1];
+              let key = name;
+              if (m[2] !== undefined) {
+                const base = name.replace(/_(bucket|sum|count)$/, "");
+                const kept = [];
+                labelRe.lastIndex = 0;
+                let l;
+                while ((l = labelRe.exec(m[2])) !== null) {
+                  if (rejected.size > 0 && rejected.has(base + SEP + l[1] + SEP + l[2])) {
+                    const rk = base + SEP + l[1];
+                    removed.set(rk, (removed.get(rk) || 0) + 1);
+                  } else {
+                    kept.push(l[1] + '="' + l[2] + '"');
+                  }
+                }
+                if (kept.length > 0) key = name + "{" + kept.join(",") + "}";
+              }
+              sums.set(key, (sums.get(key) || 0) + Number(m[3]));
+            }
+            const out = [];
+            for (const [k, v] of sums) out.push(k + " " + v + " " + ts);
+            const rem = [];
+            for (const [k, n] of removed) {
+              const p = k.split(SEP);
+              rem.push({ metric: p[0], label: p[1], n: n });
+            }
+            bento.v0_msg_set_string(out.join("\n") + "\n");
+            bento.v0_msg_set_meta("series_out", String(sums.size));
+            bento.v0_msg_set_meta("removed", JSON.stringify(rem));
+          })();
+
+output:
+  broker:
+    pattern: fan_out
+    outputs:
+      - fallback:
+          - label: vm_import
+            http_client:
+              url: http://vm-main:8428/api/v1/import/prometheus?extra_label=web=${INSTANCE}
+              verb: POST
+              headers:
+                Content-Type: text/plain
+              timeout: 5s
+              retries: 2
+              retry_period: 200ms
+              max_retry_backoff: 1s
+          - label: send_failed
+            processors:
+              - metric:
+                  type: counter
+                  name: limiter_send_dropped
+            drop: {}
+
+      # Counts only. Metric names and label names are the only labels here.
+      - label: counters
+        processors:
+          - metric:
+              type: counter_by
+              name: limiter_series_in
+              value: '${! @series_in }'
+          - metric:
+              type: counter_by
+              name: limiter_series_out
+              value: '${! @series_out }'
+          - metric:
+              type: counter_by
+              name: limiter_redis_errors
+              value: '${! @limiter_error }'
+          - mapping: 'root = @removed.parse_json()'
+          - unarchive:
+              format: json_array
+          - metric:
+              type: counter_by
+              name: limiter_labels_removed
+              value: '${! this.n }'
+              labels:
+                metric_name: '${! this.metric }'
+                label_name: '${! this.label }'
+        drop: {}

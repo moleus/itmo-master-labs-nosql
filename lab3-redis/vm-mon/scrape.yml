@@ -1,0 +1,13 @@
+global:
+  scrape_interval: 5s
+scrape_configs:
+  - job_name: vm-mon
+    static_configs: [{targets: ["vm-mon:8428"]}]
+  - job_name: vm-main
+    static_configs: [{targets: ["vm-main:8428"]}]
+  - job_name: bento
+    static_configs: [{targets: ["bento1:4195", "bento2:4195"]}]
+  - job_name: redis
+    static_configs: [{targets: ["redis-exporter:9121"]}]
+  - job_name: web
+    static_configs: [{targets: ["web1:8080", "web2:8080"]}]
